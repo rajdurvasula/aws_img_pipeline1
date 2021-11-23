@@ -1,0 +1,256 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Launch Manage from Image Pipeline
+Parameters:
+  InitialCodeBucketName:
+    Type: String
+    Description: S3 Bucket containing build artifacts; should come from CodeBuild
+    Default: "rd-kyndryl-bucket1"
+  InitialCodeObjectKey:
+    Type: String
+    Description: S3 Bucket Key containing build artifacts; should come from CodeBuild
+    Default: "codecommit_repo.zip"
+  Subnets:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Select Subnets
+  InstanceType:
+    Type: String
+    Default: t2.micro
+    AllowedValues:
+    - t2.micro
+    - t2.small
+    - t2.medium
+    - t2.large
+  ImgPipelineParam:
+    Type: String
+    Default: 'bldimg-ImgPipeline'
+    Description: 'Image Pipeline'
+  ImgCodeBuildParam:
+    Type: String
+    Default: !Sub '${AWS::StackName}-Build'
+  ImgPipelineRole:
+    Type: String
+    Default: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${AWS::StackName}-ImgPipelineRole'
+  CodeBuildRole:
+    Type: String
+    Default: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${AWS::StackName}-CodeBuildRole'
+  BldImgParamLambdaRole:
+    Type: String
+    Default: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${AWS::StackName}-BldImgParamLambdaRole'
+  BldImgParamActionRole:
+    Type: String
+    Default: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${AWS::StackName}-BldImgParamActionRole'
+  BuildImgCFRole:
+    Type: String
+    Default: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${AWS::StackName}-BuildImgCFRole'
+  BldImgCreateActionRole:
+    Type: String
+    Default: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${AWS::StackName}-BldImgCreateActionRole'
+  BldImgApplyActionRole:
+    Type: String
+    Default: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${AWS::StackName}-BldImgApplyActionRole'
+  DeployImgCFRole:
+    Type: String
+    Default: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${AWS::StackName}-DeployImgCFRole'
+  DeployImgCreateActionRole:
+    Type: String
+    Default: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${AWS::StackName}-DeployImgCreateActionRole'
+  DeployImgApplyActionRole:
+    Type: String
+    Default: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${AWS::StackName}-DeployImgApplyActionRole'
+  BuildImgEC2Role:
+    Type: String
+    Default: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${AWS::StackName}-BuildImgEC2Role'
+  InitiatePipelineRole:
+    Type: String
+    Default: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${AWS::StackName}-InitiatePipelineRole'
+  ImgPipelinePolicy:
+    Type: String
+    Default: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${AWS::StackName}-ImgPipelinePolicy'
+  CodeBuildPolicy:
+    Type: String
+    Default: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${AWS::StackName}-CodeBuildPolicy'
+  BldImgParamLambdaPolicy:
+    Type: String
+    Default: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${AWS::StackName}-BldImgParamLambdaPolicy'
+  BldImgParamActionPolicy:
+    Type: String
+    Default: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${AWS::StackName}-BldImgParamActionPolicy'
+  BuildImgCFPolicy:
+    Type: String
+    Default: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${AWS::StackName}-BuildImgCFPolicy'
+  BuildImgCreateActionPolicy:
+    Type: String
+    Default: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${AWS::StackName}-BuildImgCreateActionPolicy'
+  BldImgApplyActionPolicy:
+    Type: String
+    Default: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${AWS::StackName}-BldImgApplyActionPolicy'
+  DeployImgCFPolicy:
+    Type: String
+    Default: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${AWS::StackName}-DeployImgCFPolicy'
+  DeployImgCreateActionPolicy:
+    Type: String
+    Default: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${AWS::StackName}-DeployImgCreateActionPolicy'
+  DeployImgApplyActionPolicy:
+    Type: String
+    Default: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${AWS::StackName}-DeployImgApplyActionPolicy'
+  BuildImgEC2Policy:
+    Type: String
+    Default: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${AWS::StackName}-BuildImgEC2Policy'
+  InitiatePipelinePolicy:
+    Type: String
+    Default: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${AWS::StackName}-InitiatePipelinePolicy'
+  BldImgEC2InstanceProfile:
+    Type: String
+    Default: !Sub 'arn:aws:iam::${AWS::AccountId}:instance-profile/${AWS::StackName}-BldImgEC2InstanceProfile'
+  BldImgParamLambdaParam:
+    Type: String
+    Default: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:bldimg-BldImgParamLambda'
+  ImgArtifactBucketParam:
+    Type: String
+    Default: 'arn:aws:s3:::rd-bldimg-store'
+Resources:
+  ImgPipeline:
+    Type: AWS::CodePipeline::Pipeline
+    DependsOn:
+    - ImgPipelinePolicy
+    Properties:
+      Name: !Ref ImgPipelineParam
+      RoleArn: !Ref ImgPipelineRole
+      Stages:
+        - Name: Initiate
+          Actions:
+          - Name: source
+            ActionTypeId:
+              Version: '1'
+              Provider: CodeCommit
+              Category: Source
+              Owner: AWS
+            OutputArtifacts:
+              - Name: source
+            InputArtifacts: []
+            Configuration:
+              RepositoryName: !Sub '${AWS::StackName}-ImgRepo'
+              BranchName: main
+              PollForSourceChanges: 'false'
+            RunOrder: 1
+            Namespace: SourceVars
+        - Actions:
+            - Name: BuildCode
+              ActionTypeId:
+                Version: '1'
+                Provider: CodeBuild
+                Category: Build
+                Owner: AWS
+              Configuration:
+                ProjectName: !Ref ImgCodeBuildParam
+              InputArtifacts:
+                - Name: source
+              OutputArtifacts:
+                - Name: jar
+              RunOrder: 1
+              Namespace: BuildVars
+        - Actions:
+            - Name: BuildImage
+              ActionTypeId:
+                Version: '1'
+                Provider: Lambda
+                Category: Invoke
+                Owner: AWS
+              Configuration:
+                FunctionName:
+                  Ref: BldImgParamLambdaParam
+                UserParameters: !Sub '/${AWS::StackName}/ImageVersion'
+              InputArtifacts:
+                - Name: jar
+              RoleArn: !Ref BldImgParamActionRole
+              RunOrder: 1
+              Namespace: BldImgParamVars
+            - Name: CreateChangeSet
+              ActionTypeId:
+                Version: '1'
+                Provider: CloudFormation
+                Category: Deploy
+                Owner: AWS
+              Configuration:
+                StackName: !Sub '${AWS::StackName}-BldImg'
+                RoleArn: !Ref BuildImgCFRole
+                ParameterOverrides: !Sub
+                  - "{${Map}}"
+                  - "Map": !Join
+                    - ','
+                    - - '"BucketName": "#{BldImgParamVars.BucketName}"'
+                      - '"ObjectKey: "#{BldImgParamVars.ObjectKey}"'
+                      - '"Version": "#{BldImgParamVars.Version}"'
+                      - !Sub '"InstanceProfile": ${BldImgEC2InstanceProfile}'
+                      - !Sub '"InstanceType": "${InstanceType}"'
+                ActionMode: CHANGE_SET_REPLACE
+                ChangeSetName: buildimage
+                TemplatePath: source::cf-build-image.yaml
+              InputArtifacts:
+                - Name: source
+              RoleArn: !Ref BldImgCreateActionRole
+              RunOrder: 2
+              Namespace: BldImgCFParamCreateVars
+            - Name: ApplyChangeSet
+              ActionTypeId:
+                Version: '1'
+                Provider: CloudFormation
+                Category: Deploy
+                Owner: AWS
+              Configuration:
+                StackName: !Sub '${AWS::StackName}-BldImg'
+                ActionMode: CHANGE_SET_EXECUTE
+                ChangeSetName: buildimage
+              RoleArn: !Ref BldImgApplyActionRole
+              RunOrder: 3
+              Namespace: BldImgCFParamApplyVars
+        - Actions:
+            - Name: DeployImage
+              ActionTypeId:
+                Version: '1'
+                Provider: CloudFormation
+                Category: Deploy
+                Owner: AWS
+              Configuration:
+                StackName: !Sub '${AWS::StackName}-DeployImg'
+                RoleArn: !Ref DeployImgCFRole
+                ParameterOverrides: !Sub
+                  - "{${Map}}"
+                  - "Map": !Join
+                    - ','
+                    - - '"AmiId": "#{BldImgCFParamApplyVars.DemoImageId}"'
+                      - '"Version": "#{BldImgParamVars.Version}"'
+                      - '"SourceAuthorDate": "#{SourceVars.AuthorDate}"'
+                      - '"SourceBranchName": "#{SourceVars.BranchName}"'
+                      - '"SourceCommitId": "#{SourceVars.CommitId}"'
+                      - '"SourceCommitMessage": "#{SourceVars.CommitMessage}"'
+                      - '"SourceCommitterDate": "#{SourceVars.CommitterDate}"'
+                      - '"SourceRepositoryName": "#{SourceVars.RepositoryName}"'
+                      - !Sub
+                        - '"Subnets": "${JoinSubnets}"'
+                        - 'JoinSubnets': !Join [ "", !Ref Subnets]
+                      - !Sub '"InstanceType": "${InstanceType}"'
+                ActionMode: CHANGE_SET_REPLACE
+                ChangeSetName: DeployImage
+                TemplatePath: source::cf-deploy-image.yaml
+              InputArtifacts:
+                - Name: source
+              RoleArn: !Ref DeployImgCreateActionRole
+              RunOrder: 1
+              Namespace: DeployImgCFParamCreateVars
+            - Name: ApplyChangeSet
+              ActionTypeId:
+                Version: '1'
+                Category: Deploy
+                Provider: CloudFormation
+                Owner: AWS
+              Configuration:
+                StackName: !Sub '${AWS::StackName}-DeployImg'
+                ActionMode: CHANGE_SET_EXECUTE
+                ChangeSetName: DeployImage
+              RoleArn: !Ref DeployImgApplyActionRole
+              RunOrder: 2
+              Namespace: DeployImgCFParamApplyVars
+      ArtifactStore:
+        Location: !Ref ImgArtifactBucketParam
+        Type: S3

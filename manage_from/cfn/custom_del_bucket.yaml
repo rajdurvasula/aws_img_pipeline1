@@ -1,0 +1,90 @@
+  DeleteImgArtifactBucket:
+    Type: Custom::DeleteImgArtifactBucket
+    DeletionPolicy: Delete
+    Properties:
+      ServiceToken: !GetAtt DeleteBucketFunction.Arn
+      BucketName: !Sub 'rd-${AWS::StackName}-store'
+  DeleteBucketFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.7
+      Role: !GetAtt DeleteBucketRole.Arn
+      Handler: index.handler
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfn-response
+
+          s3 = boto3.client('s3')
+          responseData = {}
+
+          def handler(event, context):
+            if event['RequestType'] == 'Create':
+              send_default_response(event, context)
+            elif event['RequestType'] == 'Delete':
+              delete_bucket_contents(event, context)
+            elif event ['RequestType'] == 'Update':
+              send_default_response(event, context)
+
+          def send_default_response(event, context):
+            cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+
+          def delete_bucket_contents(event, context):
+            try:
+              bucketName = event['ResourceProperties']['BucketName']
+              print('Bucket Name = %s' % bucketName)
+              obj_versions = s3.list_object_versions(Bucket=bucketName)
+              for obj_version in obj_versions['Versions']:
+                key = obj_version['Key']
+                versionId = obj_version['VersionId']
+                s3.delete_object(Bucket=bucketName,Key=key,VersionId=versionId)
+              s3.delete_bucket(Bucket=bucketName)
+              responseData['Status'] = "Bucket Deleted"
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+            except as Exception e:
+              cfnresponse.send(event, context, cfnresponse.FAILED, responseData)
+  DeleteBucketRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'rd-${AWS::StackName}-DelBuck'
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: 
+                - lambda.amazonaws.com
+      Path: '/'
+  DeleteBucketPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      Roles:
+        - Ref: DeleteBucketRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Action:
+              - s3:DeleteObjectVersion
+              - s3:DeleteObject
+              - s3:ListBucket
+              - s3:DeleteBucket
+            Effect: Allow
+            Resource:
+              - !Sub 'arn:aws:s3:::${ImgArtifactBucket}'
+              - !Sub 'arn:aws:s3:::${ImgArtifactBucket}/*'
+            
+  ImgArtifactBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: DeleteImgArtifactBucket
+    UpdateReplacePolicy: Retain
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub 'rd-${AWS::StackName}-store'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: 'AES256'
+      VersioningConfiguration:
+        Status: Enabled

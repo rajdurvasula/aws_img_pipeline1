@@ -25,29 +25,36 @@ Resources:
     Type: AWS::CodePipeline::Pipeline
     DependsOn:
     - ImgPipelinePolicy
+    - BldImgParamActionPolicy
+    - BuildImgCFPolicy
+    - BldImgApplyActionPolicy
+    - DeployImgCFPolicy
+    - DeployImgCreateActionPolicy
+    - DeployImgApplyActionPolicy
     Properties:
       Name: !Sub '${AWS::StackName}-ImgPipeline'
       RoleArn: !GetAtt ImgPipelineRole.Arn
       Stages:
         - Name: Initiate
           Actions:
-          - Name: source
-            ActionTypeId:
-              Version: '1'
-              Provider: CodeCommit
-              Category: Source
-              Owner: AWS
-            OutputArtifacts:
-              - Name: source
-            InputArtifacts: []
-            Configuration:
-              RepositoryName: !Sub '${AWS::StackName}-ImgRepo'
-              BranchName: main
-              PollForSourceChanges: 'false'
-            RunOrder: 1
-            Namespace: SourceVars
-        - Actions:
-            - Name: BuildCode
+            - Name: source
+              ActionTypeId:
+                Version: '1'
+                Provider: CodeCommit
+                Category: Source
+                Owner: AWS
+              OutputArtifacts:
+                - Name: source
+              InputArtifacts: []
+              Configuration:
+                RepositoryName: !Sub '${AWS::StackName}-ImgRepo'
+                BranchName: main
+                PollForSourceChanges: 'false'
+              RunOrder: 1
+              Namespace: SourceVars
+        - Name: BuildCode
+          Actions:
+            - Name: BuildApp
               ActionTypeId:
                 Version: '1'
                 Provider: CodeBuild
@@ -61,8 +68,9 @@ Resources:
                 - Name: jar
               RunOrder: 1
               Namespace: BuildVars
-        - Actions:
-            - Name: BuildImage
+        - Name: BuildImage
+          Actions:
+            - Name: ConvertBldImgParams
               ActionTypeId:
                 Version: '1'
                 Provider: Lambda
@@ -116,8 +124,9 @@ Resources:
               RoleArn: !GetAtt BldImgApplyActionRole.Arn
               RunOrder: 3
               Namespace: BldImgCFParamApplyVars
-        - Actions:
-            - Name: DeployImage
+        - Name: DeployImage
+          Actions:
+            - Name: CreateChangeSet
               ActionTypeId:
                 Version: '1'
                 Provider: CloudFormation
@@ -138,14 +147,15 @@ Resources:
                       - '"SourceCommitMessage": "#{SourceVars.CommitMessage}"'
                       - '"SourceCommitterDate": "#{SourceVars.CommitterDate}"'
                       - '"SourceRepositoryName": "#{SourceVars.RepositoryName}"'
-                      - !Sub [ '"Subnets": !Join [ "", !Ref Subnets]' ]
+                      - !Sub
+                        - '"Subnets": "${JoinSubnets}"'
+                        - 'JoinSubnets': !Join [ "", !Ref Subnets]
                       - !Sub '"InstanceType": "${InstanceType}"'
                 ActionMode: CHANGE_SET_REPLACE
-                ChangeSetName: DeployImage
+                ChangeSetName: deployimage
                 TemplatePath: source::cf-deploy-image.yaml
               InputArtifacts:
                 - Name: source
-              Name: CreateChangeSet
               RoleArn: !GetAtt DeployImgCreateActionRole.Arn
               RunOrder: 1
               Namespace: DeployImgCFParamCreateVars
@@ -158,12 +168,12 @@ Resources:
               Configuration:
                 StackName: !Sub '${AWS::StackName}-DeployImg'
                 ActionMode: CHANGE_SET_EXECUTE
-                ChangeSetName: DeployImage
+                ChangeSetName: deployimage
               RoleArn: !GetAtt DeployImgApplyActionRole.Arn
               RunOrder: 2
               Namespace: DeployImgCFParamApplyVars
       ArtifactStore:
-        Location: !Ref DemoArtifactBucket
+        Location: !Ref ImgArtifactBucket
         Type: S3
   AppRepository:
     Type: AWS::CodeCommit::Repository
@@ -278,17 +288,18 @@ Resources:
             version_num = current_version.split('.')
             version_num[len(version_num) - 1] = str(int(version_num[len(version_num) - 1]) + 1)
             return '.'.join(version_num)
-  AppArtifactBucket:
+  ImgArtifactBucket:
     Type: AWS::S3::Bucket
+    UpdateReplacePolicy: Retain
+    DeletionPolicy: Delete
     Properties:
+      BucketName: !Sub 'rd-${AWS::StackName}-store'
       BucketEncryption:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
               SSEAlgorithm: 'AES256'
       VersioningConfiguration:
         Status: Enabled
-      UpdateReplacePolicy: Retain
-      DeletionPolicy: Retain
   InitiatePipelineEventRule:
     Type: AWS::Events::Rule
     Properties:
@@ -325,106 +336,106 @@ Resources:
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
-      Version: "2012-10-17"
-      Statement:
-        - Action: sts:AssumeRole
-          Effect: Allow
-          Principal:
-            Service: codebuild.amazonaws.com
+        Version: "2012-10-17"
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
   BldImgParamLambdaRole:
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
-      Version: "2012-10-17"
-      Statement:
-        - Action: sts:AssumeRole
-          Effect: Allow
-          Principal:
-            Service: lambda.amazonaws.com
+        Version: "2012-10-17"
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
       ManagedPolicyArns:
         - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
   BldImgParamActionRole:
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
-      Version: "2012-10-17"
-      Statement:
-        - Action: sts:AssumeRole
-          Effect: Allow
-          Principal:
-            AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
+        Version: "2012-10-17"
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
   BuildImgCFRole:
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
-      Version: "2012-10-17"
-      Statement:
-        - Action: sts:AssumeRole
-          Effect: Allow
-          Principal:
-            Service: cloudformation.amazonaws.com
+        Version: "2012-10-17"
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: cloudformation.amazonaws.com
   BldImgCreateActionRole:
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
-      Version: "2012-10-17"
-      Statement:
-        - Action: sts:AssumeRole
-          Effect: Allow
-          Principal:
-            AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
-  BuildImgApplyActionRole:
+        Version: "2012-10-17"
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
+  BldImgApplyActionRole:
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
-      Version: "2012-10-17"
-      Statement:
-        - Action: sts:AssumeRole
-          Effect: Allow
-          Principal:
-            AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
+        Version: "2012-10-17"
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
   DeployImgCFRole:
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
-      Version: "2012-10-17"
-      Statement:
-        - Action: sts:AssumeRole
-          Effect: Allow
-          Principal:
-            Service: cloudformation.amazonaws.com
+        Version: "2012-10-17"
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: cloudformation.amazonaws.com
       ManagedPolicyArns:
         - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AWSImageBuilderReadOnlyAccess'
   DeployImgCreateActionRole:
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
-      Version: "2012-10-17"
-      Statement:
-        - Action: sts:AssumeRole
-          Effect: Allow
-          Principal:
-            AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
+        Version: "2012-10-17"
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
   DeployImgApplyActionRole:
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
-      Version: "2012-10-17"
-      Statement:
-        - Action: sts:AssumeRole
-          Effect: Allow
-          Principal:
-            AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
+        Version: "2012-10-17"
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
   BuildImgEC2Role:
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
-      Version: "2012-10-17"
-      Statement:
-        - Action: sts:AssumeRole
-          Effect: Allow
-          Principal:
-            Service: !Sub "ec2.${AWS::URLSuffix}"
+        Version: "2012-10-17"
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: !Sub "ec2.${AWS::URLSuffix}"
       ManagedPolicyArns:
         - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore'
         - !Sub 'arn:${AWS::Partition}:iam::aws:policy/EC2InstanceProfileForImageBuilder'
@@ -432,13 +443,13 @@ Resources:
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
-      Version: "2012-10-17"
-      Statement:
-        - Action: sts:AssumeRole
-          Effect: Allow
-          Principal:
-            events.amazonaws.com
-  BuildImgEC2InstanceProfile:
+        Version: "2012-10-17"
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+  BldImgEC2InstanceProfile:
     Type: AWS::IAM::InstanceProfile
     Properties:
       Roles:
@@ -447,7 +458,7 @@ Resources:
     Type: AWS::IAM::ManagedPolicy
     Properties:
       Roles:
-        - ImgPipelineRole
+        - Ref: ImgPipelineRole
       PolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -471,20 +482,20 @@ Resources:
               - s3:PutObject
             Effect: Allow
             Resource:
-              - !GetAtt AppArtifactBucket.Arn
-              - !Sub '${AppArtifactBucket.Arn}/*'
+              - !GetAtt ImgArtifactBucket.Arn
+              - !Sub '${ImgArtifactBucket.Arn}/*'
           - Action: sts:AssumeRole
             Effect: Allow
-            Resource: !GetAtt BuildImgParamActionRole.Arn
+            Resource: !GetAtt BldImgParamActionRole.Arn
           - Action: sts:AssumeRole
             Effect: Allow
             Resource: !GetAtt BuildImgCFRole.Arn
           - Action: sts:AssumeRole
             Effect: Allow
-            Resource: !GetAtt BuildImgCreateActionRole.Arn
+            Resource: !GetAtt BldImgCreateActionRole.Arn
           - Action: sts:AssumeRole
             Effect: Allow
-            Resource: !GetAtt BuildImgApplyActionRole.Arn
+            Resource: !GetAtt BldImgApplyActionRole.Arn
           - Action: sts:AssumeRole
             Effect: Allow
             Resource: !GetAtt DeployImgCFRole.Arn
@@ -516,8 +527,8 @@ Resources:
               - s3:PutObject
             Effect: Allow
             Resource:
-              - !GetAtt AppArtifactBucket.Arn
-              - !Sub '${AppArtifactBucket.Arn}/*'
+              - !GetAtt ImgArtifactBucket.Arn
+              - !Sub '${ImgArtifactBucket.Arn}/*'
   BldImgParamLambdaPolicy:
     Type: AWS::IAM::ManagedPolicy
     Properties:
@@ -527,8 +538,8 @@ Resources:
         Version: "2012-10-17"
         Statement:
           - Action:
-              - codepipeline.PutJobSuccessResult
-              - codepipeline.PutJobFailureResult
+              - codepipeline:PutJobSuccessResult
+              - codepipeline:PutJobFailureResult
             Effect: Allow
             Resource: "*"
           - Action:
@@ -550,7 +561,7 @@ Resources:
         Statement:
           - Action: lambda:InvokeFunction
             Effect: Allow
-            Resource: !GetAtt BuildImgParamLambda.Arn
+            Resource: !GetAtt BldImgParamLambda.Arn
           - Action: lambda:ListFunctions
             Effect: Allow
             Resource: "*"
@@ -574,7 +585,7 @@ Resources:
               - iam:GetInstanceProfile
             Effect: Allow
             Resource:
-              - !GetAtt BuildImgEC2InstanceProfile.Arn
+              - !GetAtt BldImgEC2InstanceProfile.Arn
               - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:instance-profile/*imagebuilder*'
           - Action:
               - iam:GetRole
@@ -631,7 +642,7 @@ Resources:
     Type: AWS::IAM::ManagedPolicy
     Properties:
       Roles:
-        - Ref: BuildImgCreateActionRole
+        - Ref: BldImgCreateActionRole
       PolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -653,13 +664,13 @@ Resources:
               - s3:ListBucket
             Effect: Allow
             Resource:
-              - !GetAtt AppArtifactBucket.Arn
-              - !Sub '${AppArtifactBucket.Arn}/*'
-  BuildImgApplyActionPolicy:
+              - !GetAtt ImgArtifactBucket.Arn
+              - !Sub '${ImgArtifactBucket.Arn}/*'
+  BldImgApplyActionPolicy:
     Type: AWS::IAM::ManagedPolicy
     Properties:
       Roles:
-        - Ref: BuildImgApplyActionRole
+        - Ref: BldImgApplyActionRole
       PolicyDocument:
         Version: "2012-10-17"
         Statement:
