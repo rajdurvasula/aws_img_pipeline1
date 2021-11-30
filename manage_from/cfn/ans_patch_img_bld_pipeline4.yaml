@@ -1,0 +1,639 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Launch Manage from Image Pipeline
+Parameters:
+  InitialCodeBucketName:
+    Type: String
+    Description: S3 Bucket containing build artifacts; should come from CodeBuild
+    Default: "rd-kyndryl-bucket1"
+  InitialCodeObjectKey:
+    Type: String
+    Description: S3 Bucket Key containing build artifacts; should come from CodeBuild
+    Default: "codecommit_repo.zip"
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Select Subnet Id
+    Default: "subnet-066ffc262996d99ed"
+  SecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Select Security Group
+    Default: "sg-046330923b70dc755"
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Select Key Name
+    Default: "kyndryl_rd_tok"
+  Architecture:
+    Type: String
+    Default: 'x86'
+  InstanceType:
+    Type: String
+    Default: t2.micro
+    AllowedValues:
+    - t2.micro
+    - t2.small
+    - t2.medium
+    - t2.large
+  ParentImageVersion:
+    Type: String
+    Description: Parent Image Version
+    Default: "os-pkgs/1.0.1"
+Resources:
+  ImgPipeline:
+    Type: AWS::CodePipeline::Pipeline
+    DependsOn:
+    - ImgPipelinePolicy
+    - BldImgParamActionPolicy
+    - BuildImgCFPolicy
+    - BldImgApplyActionPolicy
+    Properties:
+      Name: !Sub '${AWS::StackName}-ImgPipeline'
+      RoleArn: !GetAtt ImgPipelineRole.Arn
+      Stages:
+        - Name: Initiate
+          Actions:
+            - Name: source
+              ActionTypeId:
+                Version: '1'
+                Provider: CodeCommit
+                Category: Source
+                Owner: AWS
+              OutputArtifacts:
+                - Name: source
+              InputArtifacts: []
+              Configuration:
+                RepositoryName: !Sub '${AWS::StackName}-Repository'
+                BranchName: main
+                PollForSourceChanges: 'false'
+              RunOrder: 1
+              Namespace: SourceVars
+        - Name: BuildCode
+          Actions:
+            - Name: BuildApp
+              ActionTypeId:
+                Version: '1'
+                Provider: CodeBuild
+                Category: Build
+                Owner: AWS
+              Configuration:
+                ProjectName: !Ref ImgCodeBuild
+              InputArtifacts:
+                - Name: source
+              OutputArtifacts:
+                - Name: jar
+              RunOrder: 1
+              Namespace: BuildVars
+        - Name: BuildImage
+          Actions:
+            - Name: ConvertBldImgParams
+              ActionTypeId:
+                Version: '1'
+                Provider: Lambda
+                Category: Invoke
+                Owner: AWS
+              Configuration:
+                FunctionName:
+                  Ref: BldImgParamLambda
+                UserParameters: !Sub '/${AWS::StackName}/ImageVersion'
+              InputArtifacts:
+                - Name: jar
+              RoleArn: !GetAtt BldImgParamActionRole.Arn
+              RunOrder: 1
+              Namespace: BldImgParamVars
+            - Name: CreateChangeSet
+              ActionTypeId:
+                Version: '1'
+                Provider: CloudFormation
+                Category: Deploy
+                Owner: AWS
+              Configuration:
+                StackName: !Sub '${AWS::StackName}-BldImg'
+                RoleArn: !GetAtt BuildImgCFRole.Arn
+                ActionMode: CHANGE_SET_REPLACE
+                ChangeSetName: buildimage
+                TemplatePath: source::app-build-image.yaml
+                ParameterOverrides: !Sub
+                  - "{${Map}}"
+                  - "Map": !Join
+                    - ","
+                    - - '"BucketName": "#{BldImgParamVars.BucketName}"'
+                      - '"ObjectKey": "#{BldImgParamVars.ObjectKey}"'
+                      - '"Version": "#{BldImgParamVars.Version}"'
+                      - !Sub '"InstanceProfile": "${BldImgEC2InstanceProfile}"'
+                      - !Sub '"Architecture": "${Architecture}"'
+                      - !Sub '"InstanceType": "${InstanceType}"'
+                      - !Sub '"KeyName": "${KeyName}"'
+                      - !Sub '"SubnetId": "${SubnetId}"'
+                      - !Sub '"SecurityGroupId": "${SecurityGroupId}"'
+                      - !Sub '"ParentImageVersion": "${ParentImageVersion}"'
+              InputArtifacts:
+                - Name: source
+              RoleArn: !GetAtt BldImgCreateActionRole.Arn
+              RunOrder: 2
+              Namespace: BldImgCFParamCreateVars
+            - Name: ApplyChangeSet
+              ActionTypeId:
+                Version: '1'
+                Provider: CloudFormation
+                Category: Deploy
+                Owner: AWS
+              Configuration:
+                StackName: !Sub '${AWS::StackName}-BldImg'
+                ActionMode: CHANGE_SET_EXECUTE
+                ChangeSetName: buildimage
+              RoleArn: !GetAtt BldImgApplyActionRole.Arn
+              RunOrder: 3
+              Namespace: BldImgCFParamApplyVars
+      ArtifactStore:
+        Location: !Ref ImgArtifactBucket
+        Type: S3
+  AppRepository:
+    Type: AWS::CodeCommit::Repository
+    Properties:
+      Code:
+        S3:
+          Bucket: !Ref InitialCodeBucketName
+          Key: !Ref InitialCodeObjectKey
+      RepositoryDescription: !Sub 'Spring Boot application repository'
+      RepositoryName: !Sub '${AWS::StackName}-Repository'
+  ImgCodeBuild:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/java:openjdk-11
+        PrivilegedMode: false
+        Type: LINUX_CONTAINER
+      Name: !Sub '${AWS::StackName}-Build'
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Source:
+        Type: CODEPIPELINE
+  BldImgParamLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt BldImgParamLambdaRole.Arn
+      Runtime: python3.7
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import boto3
+
+          codepipeline = boto3.client('codepipeline')
+          ssm = boto3.client('ssm')
+
+          # constants
+          default_version = '1.0.0'
+
+          def handler(event, context):
+            job = event['CodePipeline.job']
+            try:
+              # Read SSM key name from ParameterStore passed to Lambda
+              key_name = job['data']['actionConfiguration']['configuration']['UserParameters']
+              # Read reference to input artifact
+              input_artifacts = read_artifacts(job['data']['inputArtifacts'])
+              # Get recent version and increment by 1
+              version = getNextVersion(key_name)
+              # Return success to Codepipeline, return output variables
+              codepipeline.put_job_success_result(
+                jobId = job['id'],
+                executionDetails = {
+                  'summary': 'Automation job succeeded'
+                },
+                outputVariables = {
+                  'BucketName': input_artifacts['bucket_name'],
+                  'ObjectKey': input_artifacts['object_key'],
+                  'Version': version
+                }
+              )
+            except Exception as e:
+              print(e)
+              codepipeline.put_job_failure_result(
+                jobId = job['id'],
+                failureDetails = {
+                  'message': 'Automation job failed',
+                  'type': 'JobFailed'
+                }
+              )
+            return
+          
+          def read_artifacts(artifacts):
+            result = {
+              'name': 'unknown',
+              'object_key': 'unknown',
+              'bucket_name': 'unknown'
+            }
+            for artifact in artifacts:
+              if 'location' in artifact.keys():
+                location = artifact['location']
+                if location['type'] == 'S3':
+                  result['object_key'] = location['s3Location']['objectKey']
+                  result['bucket_name'] = location['s3Location']['bucketName']
+              elif 'name' in artifacts.keys():
+                result['name'] = artifact['name']
+            return result
+          
+          def getNextVersion(key_name):
+            param_exists = ssm.describe_parameters(ParameterFilters = [ { 'Key': 'Name', 'Values': [ key_name ] }])
+            current_version = default_version
+            if len(param_exists['Parameters']) > 0:
+              param = ssm.get_parameter(Name=key_name)
+              current_version = param['Parameter']['Value']
+            new_version = incrementVersion(current_version)
+            ssm.put_parameter(
+              Name=key_name,
+              Value=new_version,
+              Type='String',
+              Overwrite=True
+            )
+            return current_version
+            
+          def incrementVersion(current_version):
+            version_num = current_version.split('.')
+            version_num[len(version_num) - 1] = str(int(version_num[len(version_num) - 1]) + 1)
+            return '.'.join(version_num)
+  ImgArtifactBucket:
+    Type: AWS::S3::Bucket
+    UpdateReplacePolicy: Retain
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub 'rd-${AWS::StackName}-store'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: 'AES256'
+      VersioningConfiguration:
+        Status: Enabled
+  InitiatePipelineEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventPattern:
+        source:
+          - aws:codecommit
+        detail-type:
+          - 'CodeCommit Repository State Change'
+        resources:
+          - !Sub 'arn:${AWS::Partition}:codecommit:${AWS::Region}:${AWS::AccountId}:${AWS::StackName}-Repository'
+        detail:
+          event:
+            - referenceCreated
+            - referenceUpdated
+          referenceType:
+            - branch
+          referenceName:
+            - main
+      Targets:
+        - Arn: !Sub 'arn:${AWS::Partition}:codepipeline:${AWS::Region}:${AWS::AccountId}:${ImgPipeline}'
+          RoleArn: !GetAtt InitiatePipelineRole.Arn
+          Id: !Sub '${AWS::StackName}-InitiatePipeline'
+  ImgPipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+  BldImgParamLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+  BldImgParamActionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
+  BuildImgCFRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: cloudformation.amazonaws.com
+  BldImgCreateActionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
+  BldImgApplyActionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
+  BuildImgEC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: !Sub "ec2.${AWS::URLSuffix}"
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore'
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/EC2InstanceProfileForImageBuilder'
+  InitiatePipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+  BldImgEC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref BuildImgEC2Role
+  ImgPipelinePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Roles:
+        - Ref: ImgPipelineRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Action:
+              - codebuild:BatchGetBuilds
+              - codebuild:StartBuild
+              - codebuild:StopBuild
+            Effect: Allow
+            Resource: !GetAtt ImgCodeBuild.Arn
+          - Action:
+              - codecommit:CancelUploadArchive
+              - codecommit:GetBranch
+              - codecommit:GetCommit
+              - codecommit:GetUploadArchiveStatus
+              - codecommit:UploadArchive
+            Effect: Allow
+            Resource: !GetAtt AppRepository.Arn
+          - Action:
+              - s3:GetObject
+              - s3:ListBucket
+              - s3:PutObject
+            Effect: Allow
+            Resource:
+              - !GetAtt ImgArtifactBucket.Arn
+              - !Sub 'arn:aws:s3:::${InitialCodeBucketName}'
+              - !Sub '${ImgArtifactBucket.Arn}/*'
+              - !Sub 'arn:aws:s3:::${InitialCodeBucketName}/*'
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Resource: !GetAtt BldImgParamActionRole.Arn
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Resource: !GetAtt BuildImgCFRole.Arn
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Resource: !GetAtt BldImgCreateActionRole.Arn
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Resource: !GetAtt BldImgApplyActionRole.Arn
+  CodeBuildPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Roles:
+        - Ref: CodeBuildRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Effect: Allow
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${ImgCodeBuild}'
+              - !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${ImgCodeBuild}:*'
+          - Action:
+              - s3:GetObject
+              - s3:ListObject
+              - s3:PutObject
+            Effect: Allow
+            Resource:
+              - !GetAtt ImgArtifactBucket.Arn
+              - !Sub '${ImgArtifactBucket.Arn}/*'
+  BldImgParamLambdaPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Roles:
+        - Ref: BldImgParamLambdaRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Action:
+              - codepipeline:PutJobSuccessResult
+              - codepipeline:PutJobFailureResult
+            Effect: Allow
+            Resource: "*"
+          - Action:
+              - ssm:DescribeParameters
+            Effect: Allow
+            Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:*"
+          - Action:
+              - ssm:PutParameter
+              - ssm:GetParameter
+            Effect: Allow
+            Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/ImageVersion'
+  BldImgParamActionPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Roles:
+        - Ref: BldImgParamActionRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Action: lambda:InvokeFunction
+            Effect: Allow
+            Resource: !GetAtt BldImgParamLambda.Arn
+          - Action: lambda:ListFunctions
+            Effect: Allow
+            Resource: "*"
+  BuildImgCFPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Roles:
+        - Ref: BuildImgCFRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Action:
+              - iam:CreateServiceLinkedRole
+            Effect: Allow
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/aws-service-role/imagebuilder.amazonaws.com/AWSServiceRoleForImageBuilder'
+            Condition:
+              StringLike:
+                iam:AWSServiceName: "imagebuilder.amazonaws.com"
+          - Action:
+              - iam:GetInstanceProfile
+            Effect: Allow
+            Resource:
+              - !GetAtt BldImgEC2InstanceProfile.Arn
+              - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:instance-profile/*imagebuilder*'
+          - Action:
+              - iam:GetRole
+            Effect: Allow
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/aws-service-role/imagebuilder.amazonaws.com/AWSServiceRoleForImageBuilder'
+          - Action:
+              - iam:ListInstanceProfiles
+              - iam:ListRoles
+            Effect: Allow
+            Resource: "*"
+          - Action:
+              - iam:PassRole
+            Effect: Allow
+            Resource:
+              - !GetAtt BuildImgEC2Role.Arn
+              - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:instance-profile/*imagebuilder*'
+              - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/*imagebuilder*'
+            Condition:
+              StringEquals:
+                iam:PassedToService: "ec2.amazonaws.com"
+          - Action:
+              - imagebuilder:GetImage
+              - imagebuilder:GetComponent
+              - imagebuilder:CreateImage
+              - imagebuilder:GetInfrastructureConfiguration
+              - imagebuilder:DeleteImage
+              - imagebuilder:CreateComponent
+              - imagebuilder:DeleteComponent
+              - imagebuilder:GetImageRecipe
+              - imagebuilder:CreateImageRecipe
+              - imagebuilder:DeleteImageRecipe
+              - imagebuilder:CreateInfrastructureConfiguration
+              - imagebuilder:DeleteInfrastructureConfiguration
+              - imagebuilder:UpdateInfrastructureConfiguration
+              - imagebuilder:TagResource
+              - imagebuilder:UntagResource
+            Effect: Allow
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:imagebuilder:${AWS::Region}:${AWS::AccountId}:image/*/*'
+              - !Sub 'arn:${AWS::Partition}:imagebuilder:${AWS::Region}:*:image/*/*/*'
+              - !Sub 'arn:${AWS::Partition}:imagebuilder:${AWS::Region}:${AWS::AccountId}:create-image/*'
+              - !Sub 'arn:${AWS::Partition}:imagebuilder:${AWS::Region}:${AWS::AccountId}:image-recipe/*/*'
+              - !Sub 'arn:${AWS::Partition}:imagebuilder:${AWS::Region}:${AWS::AccountId}:component/*/*'
+              - !Sub 'arn:${AWS::Partition}:imagebuilder:${AWS::Region}:${AWS::AccountId}:component/*/*/*'
+              - !Sub 'arn:${AWS::Partition}:imagebuilder:${AWS::Region}:${AWS::AccountId}:infrastructure-configuration/*'
+          - Action:
+              - ec2:DescribeInstances
+              - ec2:DescribeImages
+              - ec2:DescribeTags
+              - ec2:DescribeSnapshots
+            Effect: Allow
+            Resource: "*"
+  BuildImgCreateActionPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Roles:
+        - Ref: BldImgCreateActionRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Action:
+              - cloudformation:CreateChangeSet
+              - cloudformation:DeleteChangeSet
+              - cloudformation:DescribeChangeSet
+              - cloudformation:DescribeStacks
+            Effect: Allow
+            Resource: !Sub 'arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}-BldImg/*'
+            Condition:
+              StringEqualsIfExists:
+                cloudformation:ChangeSetName: buildimage
+          - Action: iam:PassRole
+            Effect: Allow
+            Resource: !GetAtt BuildImgCFRole.Arn
+          - Action:
+              - s3:GetObject
+              - s3:ListBucket
+            Effect: Allow
+            Resource:
+              - !GetAtt ImgArtifactBucket.Arn
+              - !Sub '${ImgArtifactBucket.Arn}/*'
+  BldImgApplyActionPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Roles:
+        - Ref: BldImgApplyActionRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Action:
+              - cloudformation:DescribeChangeSet
+              - cloudformation:DescribeStacks
+              - cloudformation:ExecuteChangeSet
+            Effect: Allow
+            Resource: !Sub 'arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}-BldImg/*'
+            Condition:
+              StringEqualsIfExists:
+                cloudformation:ChangeSetName: buildimage
+  BuildImgEC2Policy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Roles:
+        - Ref: BuildImgEC2Role
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Action:
+              - s3:GetObject
+              - s3:ListBucket
+            Effect: Allow
+            Resource:
+              - !GetAtt ImgArtifactBucket.Arn
+              - !Sub '${ImgArtifactBucket.Arn}/*'
+              - !Sub 'arn:aws:s3:::${InitialCodeBucketName}'
+              - !Sub 'arn:aws:s3:::${InitialCodeBucketName}/*'
+  InitiatePipelinePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Roles:
+        - Ref: InitiatePipelineRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Action: codepipeline:StartPipelineExecution
+            Effect: Allow
+            Resource: !Sub 'arn:${AWS::Partition}:codepipeline:${AWS::Region}:${AWS::AccountId}:${ImgPipeline}'

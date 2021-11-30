@@ -12,6 +12,15 @@ Parameters:
   Subnets:
     Type: List<AWS::EC2::Subnet::Id>
     Description: Select Subnets
+  SecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Select Security Group
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Select Key Name
+  Architecture:
+    Type: String
+    Default: 'x86'
   InstanceType:
     Type: String
     Default: t2.micro
@@ -47,7 +56,7 @@ Resources:
                 - Name: source
               InputArtifacts: []
               Configuration:
-                RepositoryName: !Sub '${AWS::StackName}-ImgRepo'
+                RepositoryName: !Sub '${AWS::StackName}-Repository'
                 BranchName: main
                 PollForSourceChanges: 'false'
               RunOrder: 1
@@ -94,18 +103,19 @@ Resources:
               Configuration:
                 StackName: !Sub '${AWS::StackName}-BldImg'
                 RoleArn: !GetAtt BuildImgCFRole.Arn
+                ActionMode: CHANGE_SET_REPLACE
+                ChangeSetName: buildimage
+                TemplatePath: source::app-build-image.yaml
                 ParameterOverrides: !Sub
                   - "{${Map}}"
                   - "Map": !Join
-                    - ','
+                    - ","
                     - - '"BucketName": "#{BldImgParamVars.BucketName}"'
-                      - '"ObjectKey: "#{BldImgParamVars.ObjectKey}"'
+                      - '"ObjectKey": "#{BldImgParamVars.ObjectKey}"'
                       - '"Version": "#{BldImgParamVars.Version}"'
-                      - !Sub '"InstanceProfile": ${BldImgEC2InstanceProfile}'
-                      - !Sub '"InstanceType": "${InstanceType}"'
-                ActionMode: CHANGE_SET_REPLACE
-                ChangeSetName: buildimage
-                TemplatePath: source::cf-build-image.yaml
+                      - !Sub '"InstanceProfile": "${BldImgEC2InstanceProfile}"'
+                      - !Sub '"Architecture": "${Architecture}"'
+                      - !Sub '"InstanceType": "${InstanceType}"'            
               InputArtifacts:
                 - Name: source
               RoleArn: !GetAtt BldImgCreateActionRole.Arn
@@ -138,8 +148,8 @@ Resources:
                 ParameterOverrides: !Sub
                   - "{${Map}}"
                   - "Map": !Join
-                    - ','
-                    - - '"AmiId": "#{BldImgCFParamApplyVars.DemoImageId}"'
+                    - ","
+                    - - '"AmiId": "#{BldImgCFParamApplyVars.AppImageId}"'
                       - '"Version": "#{BldImgParamVars.Version}"'
                       - '"SourceAuthorDate": "#{SourceVars.AuthorDate}"'
                       - '"SourceBranchName": "#{SourceVars.BranchName}"'
@@ -147,13 +157,15 @@ Resources:
                       - '"SourceCommitMessage": "#{SourceVars.CommitMessage}"'
                       - '"SourceCommitterDate": "#{SourceVars.CommitterDate}"'
                       - '"SourceRepositoryName": "#{SourceVars.RepositoryName}"'
-                      - !Sub
+                      - !Sub 
                         - '"Subnets": "${JoinSubnets}"'
-                        - 'JoinSubnets': !Join [ "", !Ref Subnets]
+                        - 'JoinSubnets': !Join [",", !Ref Subnets]
                       - !Sub '"InstanceType": "${InstanceType}"'
+                      - !Sub '"SecurityGroupId": "${SecurityGroupId}"'
+                      - !Sub '"KeyName": "${KeyName}"'
                 ActionMode: CHANGE_SET_REPLACE
                 ChangeSetName: deployimage
-                TemplatePath: source::cf-deploy-image.yaml
+                TemplatePath: source::app-deploy-image.yaml
               InputArtifacts:
                 - Name: source
               RoleArn: !GetAtt DeployImgCreateActionRole.Arn
@@ -264,26 +276,20 @@ Resources:
             return result
           
           def getNextVersion(key_name):
-            param_exists = ssm.describe_parameters(
-              ParamterFilters = [
-                {
-                  'Key': 'Name',
-                  'Values': [ key_name ]
-                }
-              ]
-              current_version = default_version
-              if len(param_exists['Parameters']) > 0:
-                param = ssm.get_parameter(Name=key_name)
-                current_version = param['Parameter']['Value']
-              new_version = incrementVersion(current_version)
-              ssm.put_parameter(
-                Name=key_name,
-                Value=new_version,
-                Type='String',
-                Overwrite=True
-              )
-              return current_version
+            param_exists = ssm.describe_parameters(ParameterFilters = [ { 'Key': 'Name', 'Values': [ key_name ] }])
+            current_version = default_version
+            if len(param_exists['Parameters']) > 0:
+              param = ssm.get_parameter(Name=key_name)
+              current_version = param['Parameter']['Value']
+            new_version = incrementVersion(current_version)
+            ssm.put_parameter(
+              Name=key_name,
+              Value=new_version,
+              Type='String',
+              Overwrite=True
             )
+            return current_version
+            
           def incrementVersion(current_version):
             version_num = current_version.split('.')
             version_num[len(version_num) - 1] = str(int(version_num[len(version_num) - 1]) + 1)
@@ -483,7 +489,9 @@ Resources:
             Effect: Allow
             Resource:
               - !GetAtt ImgArtifactBucket.Arn
+              - !Sub 'arn:aws:s3:::${InitialCodeBucketName}'
               - !Sub '${ImgArtifactBucket.Arn}/*'
+              - !Sub 'arn:aws:s3:::${InitialCodeBucketName}/*'
           - Action: sts:AssumeRole
             Effect: Allow
             Resource: !GetAtt BldImgParamActionRole.Arn
@@ -652,7 +660,7 @@ Resources:
               - cloudformation:DescribeChangeSet
               - cloudformation:DescribeStacks
             Effect: Allow
-            Resource: !Sub 'arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}-BuildImg/*'
+            Resource: !Sub 'arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}-BldImg/*'
             Condition:
               StringEqualsIfExists:
                 cloudformation:ChangeSetName: buildimage
@@ -679,7 +687,7 @@ Resources:
               - cloudformation:DescribeStacks
               - cloudformation:ExecuteChangeSet
             Effect: Allow
-            Resource: !Sub 'arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}-BuildImg/*'
+            Resource: !Sub 'arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}-BldImg/*'
             Condition:
               StringEqualsIfExists:
                 cloudformation:ChangeSetName: buildimage
@@ -695,7 +703,7 @@ Resources:
               - autoscaling:CreateAutoScalingGroup
               - autoscaling:DeleteAutoScalingGroup
               - autoscaling:DeletePolicy
-              - autoscaling:ApplyPolicy
+              - autoscaling:ExecutePolicy
               - autoscaling:PutScalingPolicy
               - autoscaling:SetDesiredCapacity
               - autoscaling:SetInstanceHealth
@@ -762,7 +770,7 @@ Resources:
               - ec2:RunInstances
             Effect: Allow
             Resource:
-              - !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}::image/ami-*'
+              - !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}::image/*'
               - !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:security-group/*'
               - !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:subnet/*'
               - !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:network-interface/*'
@@ -854,6 +862,8 @@ Resources:
             Resource:
               - !GetAtt ImgArtifactBucket.Arn
               - !Sub '${ImgArtifactBucket.Arn}/*'
+              - !Sub 'arn:aws:s3:::${InitialCodeBucketName}'
+              - !Sub 'arn:aws:s3:::${InitialCodeBucketName}/*'
   InitiatePipelinePolicy:
     Type: AWS::IAM::ManagedPolicy
     Properties:
