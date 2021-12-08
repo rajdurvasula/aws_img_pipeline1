@@ -577,6 +577,10 @@ Resources:
               - imagebuilder:DeleteDistributionConfiguration
               - imagebuilder:GetDistributionConfiguration
               - imagebuilder:UpdateDistributionConfiguration
+              - imagebuilder:GetImagePipeline
+              - imagebuilder:CreateImagePipeline
+              - imagebuilder:DeleteImagePipeline
+              - imagebuilder:UpdateImagePipeline
               - imagebuilder:TagResource
               - imagebuilder:UntagResource
             Effect: Allow
@@ -590,6 +594,7 @@ Resources:
               - !Sub 'arn:${AWS::Partition}:imagebuilder:${AWS::Region}:${AWS::AccountId}:infrastructure-configuration/*'
               - !Sub 'arn:${AWS::Partition}:imagebuilder:${AWS::Region}:${AWS::AccountId}:distribution-configuration/*'
               - !Sub 'arn:${AWS::Partition}:imagebuilder:${AWS::Region}:${AWS::AccountId}:create-distribution/*'
+              - !Sub 'arn:${AWS::Partition}:imagebuilder:${AWS::Region}:${AWS::AccountId}:image-pipeline/*'
           - Action:
               - ec2:DescribeInstances
               - ec2:DescribeImages
