@@ -8,7 +8,7 @@ Parameters:
   InitialCodeObjectKey:
     Type: String
     Description: S3 Bucket Key containing build artifacts; should come from CodeBuild
-    Default: "codecommit_repo.zip"
+    Default: "img_pipeline_repo.zip"
   SubnetId:
     Type: AWS::EC2::Subnet::Id
     Description: Select Subnet Id
@@ -21,6 +21,13 @@ Parameters:
     Type: AWS::EC2::KeyPair::KeyName
     Description: Select Key Name
     Default: "kyndryl_rd_tok"
+  OS:
+    Type: String
+    Description: Operating System
+    AllowedValues:
+      - rhel
+      - sles
+      - ubuntu
   Architecture:
     Type: String
     Default: 'x86'
@@ -32,10 +39,12 @@ Parameters:
     - t2.small
     - t2.medium
     - t2.large
-  ParentImageVersion:
-    Type: String
-    Description: Parent Image Version
-    Default: "os-pkgs/1.0.1"
+Mappings:
+  BaseAMI:
+    ap-northeast-1:
+      rhel: 'ami-03a9bca8a45938066'
+      ubuntu: 'ami-05dfb0d8f3ff64305'
+      sles: 'ami-04fef8f6fa5d4ed93'
 Resources:
   ImgPipeline:
     Type: AWS::CodePipeline::Pipeline
@@ -94,7 +103,7 @@ Resources:
                   Ref: BldImgParamLambda
                 UserParameters: !Sub '/${AWS::StackName}/ImageVersion'
               InputArtifacts:
-                - Name: jar
+                - Name: source
               RoleArn: !GetAtt BldImgParamActionRole.Arn
               RunOrder: 1
               Namespace: BldImgParamVars
@@ -108,6 +117,7 @@ Resources:
                 StackName: !Sub '${AWS::StackName}-BldImg'
                 RoleArn: !GetAtt BuildImgCFRole.Arn
                 ActionMode: CHANGE_SET_REPLACE
+                Capabilities: "CAPABILITY_IAM,CAPABILITY_NAMED_IAM"
                 ChangeSetName: buildimage
                 TemplatePath: source::app-build-image.yaml
                 ParameterOverrides: !Sub
@@ -118,12 +128,15 @@ Resources:
                       - '"ObjectKey": "#{BldImgParamVars.ObjectKey}"'
                       - '"Version": "#{BldImgParamVars.Version}"'
                       - !Sub '"InstanceProfile": "${BldImgEC2InstanceProfile}"'
+                      - !Sub '"OS": "${OS}"'
                       - !Sub '"Architecture": "${Architecture}"'
                       - !Sub '"InstanceType": "${InstanceType}"'
                       - !Sub '"KeyName": "${KeyName}"'
                       - !Sub '"SubnetId": "${SubnetId}"'
                       - !Sub '"SecurityGroupId": "${SecurityGroupId}"'
-                      - !Sub '"ParentImageVersion": "${ParentImageVersion}"'
+                      - !Sub 
+                        - '"ParentImageId": "${RegionalAMI}"'
+                        - "RegionalAMI": !FindInMap [ BaseAMI, !Ref AWS::Region, !Ref OS ]
               InputArtifacts:
                 - Name: source
               RoleArn: !GetAtt BldImgCreateActionRole.Arn
@@ -178,6 +191,7 @@ Resources:
       Code:
         ZipFile: |
           import boto3
+          import json
 
           codepipeline = boto3.client('codepipeline')
           ssm = boto3.client('ssm')
@@ -231,6 +245,7 @@ Resources:
                   result['bucket_name'] = location['s3Location']['bucketName']
               elif 'name' in artifacts.keys():
                 result['name'] = artifact['name']
+            print('result = %s' % json.dumps(result))
             return result
           
           def getNextVersion(key_name):
@@ -337,7 +352,7 @@ Resources:
           - Action: sts:AssumeRole
             Effect: Allow
             Principal:
-              Service: cloudformation.amazonaws.com
+              Service: cloudformation.amazonaws.com      
   BldImgCreateActionRole:
     Type: AWS::IAM::Role
     Properties:
@@ -520,6 +535,18 @@ Resources:
           - Action:
               - iam:ListInstanceProfiles
               - iam:ListRoles
+              - iam:ListRolePolicies
+              - iam:GetRole
+              - iam:GetRolePolicy
+              - iam:PutRolePolicy
+              - iam:DeleteRolePolicy
+              - iam:GetPolicy
+              - iam:CreateRole
+              - iam:DeleteRole
+              - iam:CreatePolicy
+              - iam:DeletePolicy
+              - iam:DetachRolePolicy
+              - iam:AttachRolePolicy
             Effect: Allow
             Resource: "*"
           - Action:
@@ -546,6 +573,10 @@ Resources:
               - imagebuilder:CreateInfrastructureConfiguration
               - imagebuilder:DeleteInfrastructureConfiguration
               - imagebuilder:UpdateInfrastructureConfiguration
+              - imagebuilder:CreateDistributionConfiguration
+              - imagebuilder:DeleteDistributionConfiguration
+              - imagebuilder:GetDistributionConfiguration
+              - imagebuilder:UpdateDistributionConfiguration
               - imagebuilder:TagResource
               - imagebuilder:UntagResource
             Effect: Allow
@@ -557,6 +588,8 @@ Resources:
               - !Sub 'arn:${AWS::Partition}:imagebuilder:${AWS::Region}:${AWS::AccountId}:component/*/*'
               - !Sub 'arn:${AWS::Partition}:imagebuilder:${AWS::Region}:${AWS::AccountId}:component/*/*/*'
               - !Sub 'arn:${AWS::Partition}:imagebuilder:${AWS::Region}:${AWS::AccountId}:infrastructure-configuration/*'
+              - !Sub 'arn:${AWS::Partition}:imagebuilder:${AWS::Region}:${AWS::AccountId}:distribution-configuration/*'
+              - !Sub 'arn:${AWS::Partition}:imagebuilder:${AWS::Region}:${AWS::AccountId}:create-distribution/*'
           - Action:
               - ec2:DescribeInstances
               - ec2:DescribeImages
@@ -564,6 +597,12 @@ Resources:
               - ec2:DescribeSnapshots
             Effect: Allow
             Resource: "*"
+          - Action:
+              - lambda:CreateFunction
+              - lambda:DeleteFunction
+            Effect: Allow
+            Resource:
+              - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:*"
   BuildImgCreateActionPolicy:
     Type: AWS::IAM::ManagedPolicy
     Properties:
